@@ -8,15 +8,26 @@
 typedef struct {
     peripheral_context_t *ctx;
     portMUX_TYPE ticks_lock;
+    /* Signed net tick counts (quadrature: forward increments, reverse
+     * decrements). Consumed by the publish task.
+     */
     volatile int32_t left_ticks;
     volatile int32_t right_ticks;
+    /* Raw "ISR fired" counters. Used to detect real hardware activity
+     * (emulation vs real switching) and, in the debug log, to gauge how much
+     * of the interrupt load is bounce: a healthy encoder has
+     * physical_*_ticks only modestly above the decoded tick count.
+     */
     volatile int32_t physical_left_ticks;
     volatile int32_t physical_right_ticks;
+    /* Edges where both A and B appeared to change at once (illegal quadrature
+     * transition, usually electrical noise).
+     */
     volatile uint32_t rejected_left_edges;
     volatile uint32_t rejected_right_edges;
-    volatile uint32_t last_left_edge_us;
-    volatile uint32_t last_right_edge_us;
-    uint32_t edge_min_interval_us;
+    /* Last known 2-bit quadrature state per wheel: (A << 1) | B. */
+    volatile uint8_t left_quad_state;
+    volatile uint8_t right_quad_state;
     uint32_t emulate_start_ms;
     uint32_t last_debug_ms;
     uint32_t sequence;

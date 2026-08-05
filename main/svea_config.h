@@ -13,8 +13,25 @@
 #define BRIDGE_UART_RX_BUF 4096
 #define BRIDGE_UART_TX_BUF 4096
 
-#define ENCODER_LEFT_GPIO 22  /* XIAO D4 / SDA */
-#define ENCODER_RIGHT_GPIO 23 /* XIAO D5 / SCL */
+/* Quadrature encoders: two photo-interrupters (A/B) per wheel, ~90 deg apart.
+ * A channels keep the original pins; B channels are new -- update to match
+ * your actual wiring.
+ */
+#define ENCODER_LEFT_A_GPIO 22 /* XIAO D4 */
+#define ENCODER_LEFT_B_GPIO 23 /* XIAO D5 */
+#define ENCODER_RIGHT_A_GPIO 2  /* XIAO D2 */
+#define ENCODER_RIGHT_B_GPIO 21  /* XIAO D3 */
+
+/* If forward driving produces negative speed on a wheel, set its invert to 1
+ * instead of swapping wires.   
+ */
+#define ENCODER_LEFT_INVERT 0
+#define ENCODER_RIGHT_INVERT 0
+
+/* 4x quadrature decoding counts 4 edges per slot cycle.
+ * Old value was 80 (single channel, both edges, i.e. 2 edges/slot on a
+ * 40-slot disc). Two channels with 4x decoding -> 160 counts per revolution.
+ */
 #define ENCODER_TICKS_PER_REV 80.0f
 #define ENCODER_WHEEL_DIAM_M 0.115f
 #define ENCODER_WHEELBASE_M 0.32f
@@ -30,10 +47,10 @@
 /* While emulating, switch to real encoder mode if pin activity is detected. */
 #define ENCODER_AUTO_SWITCH_TO_REAL_ENABLE 1
 /* Simple band-pass plausibility filter for encoder-derived wheel speed. */
-#define ENCODER_EDGE_FILTER_ENABLE 1
+#define ENCODER_MIN_SPEED_FILTER_ENABLE 1
 /* Log raw encoder GPIO levels and counters once per second. */
 #define ENCODER_DEBUG_LOG_ENABLE 1
 #define ENCODER_DEBUG_LOG_MS 1000
-/* Emulation motion profile is intentionally hardcoded in encoder.c for
+/* Emulation motion profile is intentionally hardcoded in encoder_module.c for
  * communication/integration bringup validation.
  */

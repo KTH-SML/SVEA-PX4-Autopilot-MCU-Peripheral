@@ -7,68 +7,104 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/task.h"
+#include "hal/gpio_ll.h"
+#include "soc/gpio_struct.h"
 #include "peripheral_context.h"
 #include "peripheral_topics.h"
 #include "svea_common.h"
 #include "svea_config.h"
 
+#define ENCODER_WHEEL_LEFT 0
+#define ENCODER_WHEEL_RIGHT 1
+
 static encoder_module_t *s_isr_module = NULL;
 
-static uint32_t encoder_edge_min_interval_us(void)
-{
-    const float wheel_circ_m = (float)M_PI * ENCODER_WHEEL_DIAM_M;
-    const float meters_per_tick = wheel_circ_m / ENCODER_TICKS_PER_REV;
-    return (uint32_t)((meters_per_tick / ENCODER_MAX_SPEED_MPS) * 1000000.0f + 0.5f);
-}
+/* 4x quadrature decoding lookup table.
+ *
+ * Index = (previous_state << 2) | new_state, where each state is the 2-bit
+ * value (A << 1) | B. Valid single-channel transitions map to +1 (one
+ * direction) or -1 (the other direction). "No change" and illegal
+ * double-channel transitions map to 0 (the illegal ones are additionally
+ * counted as rejected edges in the ISR).
+ *
+ * A nice property of this scheme: optical bounce on one channel produces
+ * alternating +1/-1 deltas that cancel out exactly, so no time-based
+ * debounce is needed. Bounce still costs interrupts, though: compare
+ * physical_*_ticks against the decoded counts to see how much.
+ */
+static const int8_t s_quad_table[16] = {
+    0,  +1, -1, 0,  /* prev 00 -> 00, 01, 10, 11 */
+    -1, 0,  0,  +1, /* prev 01 -> 00, 01, 10, 11 */
+    +1, 0,  0,  -1, /* prev 10 -> 00, 01, 10, 11 */
+    0,  -1, +1, 0,  /* prev 11 -> 00, 01, 10, 11 */
+};
 
 static float encoder_bandpass_speed_rad_s(float speed_rad_s, float speed_mps)
 {
+#if ENCODER_MIN_SPEED_FILTER_ENABLE
     const float abs_speed_mps = fabsf(speed_mps);
 
     if (abs_speed_mps < ENCODER_MIN_SPEED_MPS || abs_speed_mps > ENCODER_MAX_SPEED_MPS) {
         return 0.0f;
     }
+#else
+    (void)speed_mps;
+#endif
 
     return speed_rad_s;
 }
 
 static void IRAM_ATTR encoder_gpio_isr(void *arg)
 {
-    const uint32_t pin = (uint32_t)(uintptr_t)arg;
     encoder_module_t *module = s_isr_module;
 
     if (module == NULL) {
         return;
     }
 
-    const uint32_t now_us = (uint32_t)esp_timer_get_time();
-    const uint32_t min_interval_us = module->edge_min_interval_us;
+    const bool is_left = ((uint32_t)(uintptr_t)arg == ENCODER_WHEEL_LEFT);
+
+    /* Read both channels of the affected wheel. gpio_ll_get_level is an
+     * inline register read, safe from an IRAM ISR (gpio_get_level is not
+     * guaranteed to be).
+     */
+    const uint32_t a = gpio_ll_get_level(&GPIO, is_left ? ENCODER_LEFT_A_GPIO : ENCODER_RIGHT_A_GPIO);
+    const uint32_t b = gpio_ll_get_level(&GPIO, is_left ? ENCODER_LEFT_B_GPIO : ENCODER_RIGHT_B_GPIO);
+    const uint8_t new_state = (uint8_t)((a << 1) | b);
 
     portENTER_CRITICAL_ISR(&module->ticks_lock);
-    if (pin == ENCODER_LEFT_GPIO) {
-        if (ENCODER_EDGE_FILTER_ENABLE &&
-            (uint32_t)(now_us - module->last_left_edge_us) < min_interval_us) {
+    if (is_left) {
+        const uint8_t prev_state = module->left_quad_state;
+
+        if (((prev_state ^ new_state) & 0x3) == 0x3) {
+            /* Both channels changed at once: illegal, count and resync. */
             module->rejected_left_edges++;
-            portEXIT_CRITICAL_ISR(&module->ticks_lock);
-            return;
+        } else {
+            int32_t delta = (int32_t)s_quad_table[(prev_state << 2) | new_state];
+#if ENCODER_LEFT_INVERT
+            delta = -delta;
+#endif
+            module->left_ticks += delta;
         }
 
-        module->last_left_edge_us = now_us;
+        module->left_quad_state = new_state;
         module->physical_left_ticks++;
-        module->left_ticks++;
-    } else if (pin == ENCODER_RIGHT_GPIO) {
-        if (ENCODER_EDGE_FILTER_ENABLE &&
-            (uint32_t)(now_us - module->last_right_edge_us) < min_interval_us) {
+    } else {
+        const uint8_t prev_state = module->right_quad_state;
+
+        if (((prev_state ^ new_state) & 0x3) == 0x3) {
             module->rejected_right_edges++;
-            portEXIT_CRITICAL_ISR(&module->ticks_lock);
-            return;
+        } else {
+            int32_t delta = (int32_t)s_quad_table[(prev_state << 2) | new_state];
+#if ENCODER_RIGHT_INVERT
+            delta = -delta;
+#endif
+            module->right_ticks += delta;
         }
 
-        module->last_right_edge_us = now_us;
+        module->right_quad_state = new_state;
         module->physical_right_ticks++;
-        module->right_ticks++;
     }
     portEXIT_CRITICAL_ISR(&module->ticks_lock);
 }
@@ -103,6 +139,26 @@ static void encoder_emulate_ticks(encoder_module_t *module, float meters_per_tic
     module->left_ticks += left_tick_delta;
     module->right_ticks += right_tick_delta;
     portEXIT_CRITICAL(&module->ticks_lock);
+}
+
+/* Throw away everything the emulation profile injected, so the published
+ * counters describe real wheel motion only. prev_*_ticks must be cleared in
+ * the same breath: leaving it stale would make the very next publish window
+ * see one enormous fake delta and feed it straight into the speed output.
+ */
+static void encoder_discard_emulated_ticks(encoder_module_t *module,
+                                           int32_t *discarded_left,
+                                           int32_t *discarded_right)
+{
+    portENTER_CRITICAL(&module->ticks_lock);
+    *discarded_left = module->left_ticks;
+    *discarded_right = module->right_ticks;
+    module->left_ticks = 0;
+    module->right_ticks = 0;
+    portEXIT_CRITICAL(&module->ticks_lock);
+
+    module->prev_left_ticks = 0;
+    module->prev_right_ticks = 0;
 }
 
 static bool encoder_gpio_activity_detected(encoder_module_t *module)
@@ -150,13 +206,15 @@ static void encoder_debug_log(encoder_module_t *module,
     module->last_debug_ms = time_ms;
 
     ESP_LOGI(SVEA_TAG,
-             "encoder debug: mode=%s force=%d gpio_left=%d gpio_right=%d "
+             "encoder debug: mode=%s force=%d gpio_LA=%d gpio_LB=%d gpio_RA=%d gpio_RB=%d "
              "physical_left=%ld physical_right=%ld rejected_left=%lu rejected_right=%lu "
              "publish_left=%ld publish_right=%ld d_left=%ld d_right=%ld",
              module->use_emulation ? "emulation" : "real",
              module->force_emulation ? 1 : 0,
-             gpio_get_level(ENCODER_LEFT_GPIO),
-             gpio_get_level(ENCODER_RIGHT_GPIO),
+             gpio_get_level(ENCODER_LEFT_A_GPIO),
+             gpio_get_level(ENCODER_LEFT_B_GPIO),
+             gpio_get_level(ENCODER_RIGHT_A_GPIO),
+             gpio_get_level(ENCODER_RIGHT_B_GPIO),
              (long)physical_left_ticks,
              (long)physical_right_ticks,
              (unsigned long)rejected_left_edges,
@@ -190,14 +248,24 @@ static void encoder_publish_task(void *arg)
         if (module->use_emulation) {
 #if ENCODER_AUTO_SWITCH_TO_REAL_ENABLE
             if (!module->force_emulation && encoder_gpio_activity_detected(module)) {
+                int32_t discarded_left = 0;
+                int32_t discarded_right = 0;
+
                 module->use_emulation = false;
+                encoder_discard_emulated_ticks(module, &discarded_left, &discarded_right);
+
                 ESP_LOGI(SVEA_TAG,
                          "encoder activity detected, switching from emulation to real GPIO inputs: "
-                         "gpio_left=%d gpio_right=%d physical_left=%ld physical_right=%ld",
-                         gpio_get_level(ENCODER_LEFT_GPIO),
-                         gpio_get_level(ENCODER_RIGHT_GPIO),
+                         "gpio_LA=%d gpio_LB=%d gpio_RA=%d gpio_RB=%d physical_left=%ld physical_right=%ld "
+                         "discarded_left=%ld discarded_right=%ld",
+                         gpio_get_level(ENCODER_LEFT_A_GPIO),
+                         gpio_get_level(ENCODER_LEFT_B_GPIO),
+                         gpio_get_level(ENCODER_RIGHT_A_GPIO),
+                         gpio_get_level(ENCODER_RIGHT_B_GPIO),
                          (long)module->prev_activity_left_ticks,
-                         (long)module->prev_activity_right_ticks);
+                         (long)module->prev_activity_right_ticks,
+                         (long)discarded_left,
+                         (long)discarded_right);
             }
 #endif
             if (module->use_emulation) {
@@ -265,12 +333,13 @@ void encoder_module_init(encoder_module_t *module, peripheral_context_t *ctx)
     memset(module, 0, sizeof(*module));
     module->ctx = ctx;
     module->ticks_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
-    module->edge_min_interval_us = encoder_edge_min_interval_us();
     module->emulate_start_ms = peripheral_now_ms();
     module->force_emulation = (ENCODER_EMULATION_ENABLE != 0);
     module->use_emulation = module->force_emulation;
+
     const gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << ENCODER_LEFT_GPIO) | (1ULL << ENCODER_RIGHT_GPIO),
+        .pin_bit_mask = (1ULL << ENCODER_LEFT_A_GPIO) | (1ULL << ENCODER_LEFT_B_GPIO) |
+                        (1ULL << ENCODER_RIGHT_A_GPIO) | (1ULL << ENCODER_RIGHT_B_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -278,20 +347,38 @@ void encoder_module_init(encoder_module_t *module, peripheral_context_t *ctx)
     };
 
     SVEA_CHECK(gpio_config(&cfg));
+
+    /* Seed the quadrature state machines from current pin levels BEFORE
+     * enabling interrupts, so the first real edge decodes correctly.
+     */
+    module->left_quad_state =
+        (uint8_t)((gpio_get_level(ENCODER_LEFT_A_GPIO) << 1) | gpio_get_level(ENCODER_LEFT_B_GPIO));
+    module->right_quad_state =
+        (uint8_t)((gpio_get_level(ENCODER_RIGHT_A_GPIO) << 1) | gpio_get_level(ENCODER_RIGHT_B_GPIO));
+
     SVEA_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
     s_isr_module = module;
-    SVEA_CHECK(gpio_isr_handler_add(ENCODER_LEFT_GPIO, encoder_gpio_isr, (void *)(uintptr_t)ENCODER_LEFT_GPIO));
-    SVEA_CHECK(gpio_isr_handler_add(ENCODER_RIGHT_GPIO, encoder_gpio_isr, (void *)(uintptr_t)ENCODER_RIGHT_GPIO));
+    /* Both channels of a wheel share one handler; the argument tells the ISR
+     * which wheel fired, and it re-reads both channel levels itself.
+     */
+    SVEA_CHECK(gpio_isr_handler_add(ENCODER_LEFT_A_GPIO, encoder_gpio_isr, (void *)(uintptr_t)ENCODER_WHEEL_LEFT));
+    SVEA_CHECK(gpio_isr_handler_add(ENCODER_LEFT_B_GPIO, encoder_gpio_isr, (void *)(uintptr_t)ENCODER_WHEEL_LEFT));
+    SVEA_CHECK(gpio_isr_handler_add(ENCODER_RIGHT_A_GPIO, encoder_gpio_isr, (void *)(uintptr_t)ENCODER_WHEEL_RIGHT));
+    SVEA_CHECK(gpio_isr_handler_add(ENCODER_RIGHT_B_GPIO, encoder_gpio_isr, (void *)(uintptr_t)ENCODER_WHEEL_RIGHT));
 
     ESP_LOGI(SVEA_TAG,
-             "encoder GPIO configured: left=%d level=%d right=%d level=%d pull=up intr=anyedge "
-             "filter=%d min_interval_us=%lu min_speed_mps=%.2f max_speed_mps=%.2f",
-             ENCODER_LEFT_GPIO,
-             gpio_get_level(ENCODER_LEFT_GPIO),
-             ENCODER_RIGHT_GPIO,
-             gpio_get_level(ENCODER_RIGHT_GPIO),
-             ENCODER_EDGE_FILTER_ENABLE,
-             (unsigned long)module->edge_min_interval_us,
+             "encoder GPIO configured (quadrature): LA=%d LB=%d RA=%d RB=%d "
+             "levels LA=%d LB=%d RA=%d RB=%d pull=up intr=anyedge "
+             "ticks_per_rev=%.0f min_speed_mps=%.2f max_speed_mps=%.2f",
+             ENCODER_LEFT_A_GPIO,
+             ENCODER_LEFT_B_GPIO,
+             ENCODER_RIGHT_A_GPIO,
+             ENCODER_RIGHT_B_GPIO,
+             gpio_get_level(ENCODER_LEFT_A_GPIO),
+             gpio_get_level(ENCODER_LEFT_B_GPIO),
+             gpio_get_level(ENCODER_RIGHT_A_GPIO),
+             gpio_get_level(ENCODER_RIGHT_B_GPIO),
+             (double)ENCODER_TICKS_PER_REV,
              (double)ENCODER_MIN_SPEED_MPS,
              (double)ENCODER_MAX_SPEED_MPS);
 
@@ -312,9 +399,11 @@ void encoder_module_init(encoder_module_t *module, peripheral_context_t *ctx)
     }
 
     ESP_LOGI(SVEA_TAG,
-             "encoder GPIO ISR up: left=%d right=%d mode=%s",
-             ENCODER_LEFT_GPIO,
-             ENCODER_RIGHT_GPIO,
+             "encoder GPIO ISR up: LA=%d LB=%d RA=%d RB=%d mode=%s",
+             ENCODER_LEFT_A_GPIO,
+             ENCODER_LEFT_B_GPIO,
+             ENCODER_RIGHT_A_GPIO,
+             ENCODER_RIGHT_B_GPIO,
              module->use_emulation ? "emulation" : "real");
 }
 
