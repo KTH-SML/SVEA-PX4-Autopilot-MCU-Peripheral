@@ -28,9 +28,8 @@
 #define ENCODER_LEFT_INVERT 0
 #define ENCODER_RIGHT_INVERT 0
 
-/* 4x quadrature decoding counts 4 edges per slot cycle.
- * Old value was 80 (single channel, both edges, i.e. 2 edges/slot on a
- * 40-slot disc). Two channels with 4x decoding -> 160 counts per revolution.
+/* Decoded counts per wheel revolution. Measure after wiring A/B.
+ * 4x decoding of a 40-cycle/revolution encoder gives 160 counts.
  */
 #define ENCODER_TICKS_PER_REV 80.0f
 #define ENCODER_WHEEL_DIAM_M 0.115f
