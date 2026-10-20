@@ -28,9 +28,8 @@
 #define ENCODER_LEFT_INVERT 0
 #define ENCODER_RIGHT_INVERT 0
 
-/* 4x quadrature decoding counts 4 edges per slot cycle.
- * Old value was 80 (single channel, both edges, i.e. 2 edges/slot on a
- * 40-slot disc). Two channels with 4x decoding -> 160 counts per revolution.
+/* Decoded counts per wheel revolution. Measure after wiring A/B.
+ * 4x decoding of a 40-cycle/revolution encoder gives 160 counts.
  */
 #define ENCODER_TICKS_PER_REV 80.0f
 #define ENCODER_WHEEL_DIAM_M 0.115f
@@ -40,12 +39,8 @@
 #define ENCODER_MIN_SPEED_MPS 0.01f
 #define ENCODER_MAX_SPEED_MPS 5.0f
 
-/* Set to 1 to force emulation and ignore runtime GPIO activity detection. */
+/* 0: real GPIO inputs, including at rest. 1: synthetic test data only. */
 #define ENCODER_EMULATION_ENABLE 0
-/* Probe window at boot before deciding emulation mode. */
-#define ENCODER_ACTIVITY_PROBE_MS 300
-/* While emulating, switch to real encoder mode if pin activity is detected. */
-#define ENCODER_AUTO_SWITCH_TO_REAL_ENABLE 1
 /* Simple band-pass plausibility filter for encoder-derived wheel speed. */
 #define ENCODER_MIN_SPEED_FILTER_ENABLE 1
 /* Log raw encoder GPIO levels and counters once per second. */

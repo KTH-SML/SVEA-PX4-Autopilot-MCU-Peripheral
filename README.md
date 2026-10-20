@@ -4,6 +4,33 @@ ESP32-C6 firmware for a SVEA peripheral MCU that publishes PX4-uORB-aligned data
 
 The current implemented example module is `encoder` (publishes wheel topics).
 
+## Encoder Operation
+
+- UART: 115200 baud, 8N1; both topics publish every 20 ms (nominally 50 Hz).
+- `ENCODER_EMULATION_ENABLE=0`: real GPIO inputs, including at rest. No automatic emulation.
+- `ENCODER_EMULATION_ENABLE=1`: synthetic test data; GPIO interrupts are disabled.
+
+| Encoder | Upper A | Lower B |
+| --- | --- | --- |
+| Left | GPIO22 (D4) | GPIO23 (D5) |
+| Right | GPIO2 (D2) | GPIO21 (D3) |
+
+Two quadrature signals per wheel are required. GPIO23 is left B, not the right-wheel input used by the older single-channel firmware.
+
+The *SVEA Main Platform* assembly guide (page 17) shows the same D-pin wiring on an ESP32-S3. Its GPIO numbers differ from the [XIAO ESP32-C6 pinout](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/). Pages 13 and 15 show different disc slot patterns without specifying the slot count.
+
+`ENCODER_TICKS_PER_REV` is decoded counts per wheel revolution, including gearing. The current value is 80; a 40-cycle encoder with 4× decoding produces 160. Measure before changing it. Verify `ENCODER_WHEEL_DIAM_M` (0.115), `ENCODER_SPEED_SCALE` (0.93), and direction inversion against the car.
+
+At rest, distances/angles stay constant and speeds are zero. Turning one wheel changes only that wheel's data. `wheel_encoders` orders right before left; `wheel_distance` has named left/right fields.
+
+PX4 setup and verification: [Peripheral MCU Bridge](https://github.com/nilskiefer/SVEA-PX4-Autopilot/blob/main/docs/en/svea/peripheral-mcu-bridge.md).
+
+Host regression checks (Python 3 and a C compiler):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## Architecture
 
 The project is intentionally split into layers:
