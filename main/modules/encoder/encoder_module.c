@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/task.h"
 #include "hal/gpio_ll.h"
@@ -33,7 +34,7 @@ static encoder_module_t *s_isr_module = NULL;
  * debounce is needed. Bounce still costs interrupts, though: compare
  * physical_*_ticks against the decoded counts to see how much.
  */
-static const int8_t s_quad_table[16] = {
+static DRAM_ATTR const int8_t s_quad_table[16] = {
     0,  +1, -1, 0,  /* prev 00 -> 00, 01, 10, 11 */
     -1, 0,  0,  +1, /* prev 01 -> 00, 01, 10, 11 */
     +1, 0,  0,  -1, /* prev 10 -> 00, 01, 10, 11 */
