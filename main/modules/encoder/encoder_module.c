@@ -142,44 +142,6 @@ static void encoder_emulate_ticks(encoder_module_t *module, float meters_per_tic
     portEXIT_CRITICAL(&module->ticks_lock);
 }
 
-/* Throw away everything the emulation profile injected, so the published
- * counters describe real wheel motion only. prev_*_ticks must be cleared in
- * the same breath: leaving it stale would make the very next publish window
- * see one enormous fake delta and feed it straight into the speed output.
- */
-static void encoder_discard_emulated_ticks(encoder_module_t *module,
-                                           int32_t *discarded_left,
-                                           int32_t *discarded_right)
-{
-    portENTER_CRITICAL(&module->ticks_lock);
-    *discarded_left = module->left_ticks;
-    *discarded_right = module->right_ticks;
-    module->left_ticks = 0;
-    module->right_ticks = 0;
-    portEXIT_CRITICAL(&module->ticks_lock);
-
-    module->prev_left_ticks = 0;
-    module->prev_right_ticks = 0;
-}
-
-static bool encoder_gpio_activity_detected(encoder_module_t *module)
-{
-    int32_t left_ticks = 0;
-    int32_t right_ticks = 0;
-
-    portENTER_CRITICAL(&module->ticks_lock);
-    left_ticks = module->physical_left_ticks;
-    right_ticks = module->physical_right_ticks;
-    portEXIT_CRITICAL(&module->ticks_lock);
-
-    const bool activity = (left_ticks != module->prev_activity_left_ticks) ||
-                          (right_ticks != module->prev_activity_right_ticks);
-
-    module->prev_activity_left_ticks = left_ticks;
-    module->prev_activity_right_ticks = right_ticks;
-    return activity;
-}
-
 static void encoder_debug_log(encoder_module_t *module,
                               uint32_t time_ms,
                               int32_t left_ticks,
@@ -207,11 +169,10 @@ static void encoder_debug_log(encoder_module_t *module,
     module->last_debug_ms = time_ms;
 
     ESP_LOGI(SVEA_TAG,
-             "encoder debug: mode=%s force=%d gpio_LA=%d gpio_LB=%d gpio_RA=%d gpio_RB=%d "
+             "encoder debug: mode=%s gpio_LA=%d gpio_LB=%d gpio_RA=%d gpio_RB=%d "
              "physical_left=%ld physical_right=%ld rejected_left=%lu rejected_right=%lu "
              "publish_left=%ld publish_right=%ld d_left=%ld d_right=%ld",
              module->use_emulation ? "emulation" : "real",
-             module->force_emulation ? 1 : 0,
              gpio_get_level(ENCODER_LEFT_A_GPIO),
              gpio_get_level(ENCODER_LEFT_B_GPIO),
              gpio_get_level(ENCODER_RIGHT_A_GPIO),
@@ -247,31 +208,7 @@ static void encoder_publish_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(ENCODER_PUBLISH_MS));
 
         if (module->use_emulation) {
-#if ENCODER_AUTO_SWITCH_TO_REAL_ENABLE
-            if (!module->force_emulation && encoder_gpio_activity_detected(module)) {
-                int32_t discarded_left = 0;
-                int32_t discarded_right = 0;
-
-                module->use_emulation = false;
-                encoder_discard_emulated_ticks(module, &discarded_left, &discarded_right);
-
-                ESP_LOGI(SVEA_TAG,
-                         "encoder activity detected, switching from emulation to real GPIO inputs: "
-                         "gpio_LA=%d gpio_LB=%d gpio_RA=%d gpio_RB=%d physical_left=%ld physical_right=%ld "
-                         "discarded_left=%ld discarded_right=%ld",
-                         gpio_get_level(ENCODER_LEFT_A_GPIO),
-                         gpio_get_level(ENCODER_LEFT_B_GPIO),
-                         gpio_get_level(ENCODER_RIGHT_A_GPIO),
-                         gpio_get_level(ENCODER_RIGHT_B_GPIO),
-                         (long)module->prev_activity_left_ticks,
-                         (long)module->prev_activity_right_ticks,
-                         (long)discarded_left,
-                         (long)discarded_right);
-            }
-#endif
-            if (module->use_emulation) {
-                encoder_emulate_ticks(module, meters_per_tick, dt_s);
-            }
+            encoder_emulate_ticks(module, meters_per_tick, dt_s);
         }
 
         int32_t left_ticks = 0;
@@ -335,8 +272,12 @@ void encoder_module_init(encoder_module_t *module, peripheral_context_t *ctx)
     module->ctx = ctx;
     module->ticks_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     module->emulate_start_ms = peripheral_now_ms();
-    module->force_emulation = (ENCODER_EMULATION_ENABLE != 0);
-    module->use_emulation = module->force_emulation;
+    module->use_emulation = (ENCODER_EMULATION_ENABLE != 0);
+
+    if (module->use_emulation) {
+        ESP_LOGW(SVEA_TAG, "encoder emulation enabled: synthetic data, GPIO inputs disabled");
+        return;
+    }
 
     const gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << ENCODER_LEFT_A_GPIO) | (1ULL << ENCODER_LEFT_B_GPIO) |
@@ -382,22 +323,6 @@ void encoder_module_init(encoder_module_t *module, peripheral_context_t *ctx)
              (double)ENCODER_TICKS_PER_REV,
              (double)ENCODER_MIN_SPEED_MPS,
              (double)ENCODER_MAX_SPEED_MPS);
-
-    if (!module->force_emulation) {
-        bool activity = false;
-        const int probe_loops = ENCODER_ACTIVITY_PROBE_MS / ENCODER_PUBLISH_MS;
-
-        for (int i = 0; i < probe_loops; i++) {
-            if (encoder_gpio_activity_detected(module)) {
-                activity = true;
-                break;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(ENCODER_PUBLISH_MS));
-        }
-
-        module->use_emulation = !activity;
-    }
 
     ESP_LOGI(SVEA_TAG,
              "encoder GPIO ISR up: LA=%d LB=%d RA=%d RB=%d mode=%s",

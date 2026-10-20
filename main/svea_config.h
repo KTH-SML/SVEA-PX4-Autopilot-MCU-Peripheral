@@ -40,12 +40,8 @@
 #define ENCODER_MIN_SPEED_MPS 0.01f
 #define ENCODER_MAX_SPEED_MPS 5.0f
 
-/* Set to 1 to force emulation and ignore runtime GPIO activity detection. */
+/* 0: real GPIO inputs, including at rest. 1: synthetic test data only. */
 #define ENCODER_EMULATION_ENABLE 0
-/* Probe window at boot before deciding emulation mode. */
-#define ENCODER_ACTIVITY_PROBE_MS 300
-/* While emulating, switch to real encoder mode if pin activity is detected. */
-#define ENCODER_AUTO_SWITCH_TO_REAL_ENABLE 1
 /* Simple band-pass plausibility filter for encoder-derived wheel speed. */
 #define ENCODER_MIN_SPEED_FILTER_ENABLE 1
 /* Log raw encoder GPIO levels and counters once per second. */
